@@ -352,30 +352,51 @@ func optimize() error {
 		modifiedAt time.Time
 	)
 
-	currentMerges, err := runningMerges()
-	if err != nil {
-		return err
-	}
-	currentMergesCount := 0
-	for _, n := range currentMerges {
-		currentMergesCount += n
-	}
-	if cfg.ClickHouse.MaxMerges > 0 && currentMergesCount > cfg.ClickHouse.MaxMerges {
-		logrus.WithFields(logrus.Fields{
-			"running_merges": currentMerges,
-			"max_merges":     cfg.ClickHouse.MaxMerges,
-		}).Info("Already running too many merges")
-		return nil
-	}
-
 	// Parse the data from DB into `merges`
-	pendingMerges := 0
 	for rows.Next() {
 		var m merge
 		err = rows.Scan(&m.table, &m.partitionID, &m.partitionName, &age, &parts, &maxTime, &rollupTime, &modifiedAt)
 		if checkErr(err) != nil {
 			return err
 		}
+		merges = append(merges, m)
+		logrus.WithFields(logrus.Fields{
+			"table":          m.table,
+			"partition_id":   m.partitionID,
+			"partition_name": m.partitionName,
+			"age":            age,
+			"parts":          parts,
+			"max_time":       maxTime,
+			"rollup_time":    rollupTime,
+			"modified_at":    modifiedAt,
+		}).Debug("Merge to be applied")
+	}
+
+	if cfg.Daemon.DryRun {
+		logrus.Infof("DRY RUN. Merges would be applied: %d", len(merges))
+		return nil
+	}
+	logrus.Infof("Merges will be applied: %d", len(merges))
+
+	for _, m := range merges {
+		// fetch running merges
+		currentMerges, err := runningMerges()
+		if err != nil {
+			return err
+		}
+		currentMergesCount := 0
+		for _, n := range currentMerges {
+			currentMergesCount += n
+		}
+
+		if cfg.ClickHouse.MaxMerges > 0 && currentMergesCount > cfg.ClickHouse.MaxMerges {
+			logrus.WithFields(logrus.Fields{
+				"running_merges": currentMerges,
+				"max_merges":     cfg.ClickHouse.MaxMerges,
+			}).Info("Already running too many merges")
+			return nil
+		}
+
 		id := m.table + ":" + m.partitionID
 		if _, ok := currentMerges[id]; ok {
 			logrus.WithFields(logrus.Fields{
@@ -390,18 +411,12 @@ func optimize() error {
 			}).Info("Merge already running")
 			continue
 		}
-		if cfg.ClickHouse.MaxMerges == 0 || pendingMerges < cfg.ClickHouse.MaxMerges {
-			merges = append(merges, m)
-			logrus.WithFields(logrus.Fields{
-				"table":          m.table,
-				"partition_id":   m.partitionID,
-				"partition_name": m.partitionName,
-				"age":            age,
-				"parts":          parts,
-				"max_time":       maxTime,
-				"rollup_time":    rollupTime,
-				"modified_at":    modifiedAt,
-			}).Debug("Merge to be applied")
+
+		if cfg.ClickHouse.MaxMerges == 0 || currentMergesCount < cfg.ClickHouse.MaxMerges {
+			err = applyMerge(&m)
+			if checkErr(err) != nil {
+				return err
+			}
 		} else {
 			logrus.WithFields(logrus.Fields{
 				"table":          m.table,
@@ -413,20 +428,6 @@ func optimize() error {
 				"rollup_time":    rollupTime,
 				"modified_at":    modifiedAt,
 			}).Debug("Merge delayed")
-		}
-		pendingMerges++
-	}
-
-	if cfg.Daemon.DryRun {
-		logrus.Infof("DRY RUN. Merges would be applied: %d, delayed: %d", len(merges), pendingMerges-len(merges))
-		return nil
-	}
-	logrus.Infof("Merges will be applied: %d, delayed: %d", len(merges), pendingMerges-len(merges))
-
-	for _, m := range merges {
-		err = applyMerge(&m)
-		if checkErr(err) != nil {
-			return err
 		}
 	}
 	return nil
