@@ -77,7 +77,7 @@ build/pkg: build/$(NAME) build/config.toml.example
 	cp -l config.toml.example pkg/etc/$(NAME)
 
 build/$(NAME): $(NAME).go
-	GOOS=linux GOARCH=amd64 $(GO) build -ldflags "-X 'main.version=$(VERSION)'" -o $@ .
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build -ldflags "-X 'main.version=$(VERSION)'" -o $@ .
 
 build/config.toml.example: build/$(NAME)
 	./build/$(NAME) --print-defaults > $@
