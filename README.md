@@ -163,6 +163,8 @@ Default config:
 [clickhouse]
   optimize-interval = "72h0m0s"
   server-dsn = "tcp://localhost:9000?&optimize_throw_if_noop=1&receive_timeout=3600&debug=true&read_timeout=3600"
+  max-merges = 0
+  min-parts = 2
 
 [daemon]
   dry-run = false
@@ -181,6 +183,8 @@ Usage of graphite-ch-optimizer:
   -c, --config string                Filename of the custom config. CLI arguments override it (default "/etc/graphite-ch-optimizer/config.toml")
       --print-defaults               Print default config values and exit
   -v, --version                      Print version and exit
+      --max-merges int               Allow maxumum running merges at once (for reduce server load)
+      --min-parts int                Require minimum parts for merge (if no rollup) (default 2)
       --optimize-interval duration   The partition will be merged after having no writes for more than the given duration (default 72h0m0s)
   -s, --server-dsn string            DSN to connect to ClickHouse server (default "tcp://localhost:9000?&optimize_throw_if_noop=1&receive_timeout=3600&debug=true&read_timeout=3600")
   -n, --dry-run                      Will print how many partitions would be merged without actions

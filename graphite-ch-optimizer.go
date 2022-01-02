@@ -22,6 +22,8 @@ import (
 
 var version = "development"
 
+const SelectRunningMerges = "SELECT concat('`', database, '`.`', table, '`', ':', partition_id) AS table_merge_id, count(1) AS merges FROM system.merges GROUP BY database, table, partition_id"
+
 // SelectUnmerged is the query to create the temporary table with
 // partitions and the retention age, which should be applied.
 // Table name should be with backquotes to be able to OPTIMIZE `database`.`.inner.table`
@@ -60,7 +62,7 @@ GROUP BY
 -- parts > 1: merge should be applied because of new parts
 -- modified_at < (now() - @Interval): we want to merge active partitions only once per interval,
 --   so do not touch partitions with current active inserts
-HAVING ((modified_at < rollup_time) OR (parts > 1))
+HAVING ((modified_at < rollup_time) OR (parts > @MinParts))
 	AND (modified_at < (now() - @Interval))
 ORDER BY
 	table ASC,
@@ -77,6 +79,8 @@ type merge struct {
 type clickHouse struct {
 	ServerDsn        string        `mapstructure:"server-dsn" toml:"server-dsn"`
 	OptimizeInterval time.Duration `mapstructure:"optimize-interval" toml:"optimize-interval"`
+	MinParts         int           `mapstructure:"min-parts" toml:"min-parts"`
+	MaxMerges        int           `mapstructure:"max-merges" toml:"max-merges"`
 	connect          *sql.DB
 }
 
@@ -134,6 +138,10 @@ func init() {
 		logrus.Fatalf("Failed to marshal TOML config: %v", err)
 	}
 	logrus.Tracef("The config is:\n%v", string(configString))
+
+	if cfg.ClickHouse.MinParts < 2 {
+		logrus.Fatalf("clickhouse.min-parts must be > 1")
+	}
 }
 
 // setDefaultConfig sets default config parameters
@@ -145,6 +153,8 @@ func setDefaultConfig() {
 		"server-dsn": "tcp://localhost:9000?&optimize_throw_if_noop=1&receive_timeout=3600&debug=true&read_timeout=3600",
 		// Ignore partitions which were merged less than 3 days before
 		"optimize-interval": time.Duration(72) * time.Hour,
+		"max-merges":        0,
+		"min-parts":         2,
 	})
 	viper.SetDefault("daemon", map[string]interface{}{
 		"one-shot":      false,
@@ -169,6 +179,8 @@ func processFlags() error {
 	fc := pflag.NewFlagSet("clickhouse", 0)
 	fc.StringP("server-dsn", "s", viper.GetString("clickhouse.server-dsn"), "DSN to connect to ClickHouse server")
 	fc.Duration("optimize-interval", viper.GetDuration("clickhouse.optimize-interval"), "The partition will be merged after having no writes for more than the given duration")
+	fc.Int("min-parts", viper.GetInt("clickhouse.min-parts"), "Require minimum parts for merge (if no rollup)")
+	fc.Int("max-merges", viper.GetInt("clickhouse.max-merges"), "Allow maxumum running merges at once (for reduce server load)")
 	// Daemon set
 	fd := pflag.NewFlagSet("daemon", 0)
 	fd.Bool("one-shot", viper.GetBool("daemon.one-shot"), "Program will make only one optimization instead of working in the loop (true if dry-run)")
@@ -325,6 +337,7 @@ func optimize() error {
 	rows, err := connect.Query(
 		SelectUnmerged,
 		sql.Named("Interval", cfg.ClickHouse.OptimizeInterval.Seconds()),
+		sql.Named("MinParts", cfg.ClickHouse.MinParts),
 	)
 	if checkErr(err) != nil {
 		return err
@@ -339,34 +352,78 @@ func optimize() error {
 		modifiedAt time.Time
 	)
 
+	currentMerges, err := runningMerges()
+	if err != nil {
+		return err
+	}
+	currentMergesCount := 0
+	for _, n := range currentMerges {
+		currentMergesCount += n
+	}
+	if cfg.ClickHouse.MaxMerges > 0 && currentMergesCount > cfg.ClickHouse.MaxMerges {
+		logrus.WithFields(logrus.Fields{
+			"running_merges": currentMerges,
+			"max_merges":     cfg.ClickHouse.MaxMerges,
+		}).Info("Already running too many merges")
+		return nil
+	}
+
 	// Parse the data from DB into `merges`
+	pendingMerges := 0
 	for rows.Next() {
 		var m merge
 		err = rows.Scan(&m.table, &m.partitionID, &m.partitionName, &age, &parts, &maxTime, &rollupTime, &modifiedAt)
 		if checkErr(err) != nil {
 			return err
 		}
-		merges = append(merges, m)
-		logrus.WithFields(logrus.Fields{
-			"table":          m.table,
-			"partition_id":   m.partitionID,
-			"partition_name": m.partitionName,
-			"age":            age,
-			"parts":          parts,
-			"max_time":       maxTime,
-			"rollup_time":    rollupTime,
-			"modified_at":    modifiedAt,
-		}).Debug("Merge to be applied")
+		id := m.table + ":" + m.partitionID
+		if _, ok := currentMerges[id]; ok {
+			logrus.WithFields(logrus.Fields{
+				"table":          m.table,
+				"partition_id":   m.partitionID,
+				"partition_name": m.partitionName,
+				"age":            age,
+				"parts":          parts,
+				"max_time":       maxTime,
+				"rollup_time":    rollupTime,
+				"modified_at":    modifiedAt,
+			}).Info("Merge already running")
+			continue
+		}
+		if cfg.ClickHouse.MaxMerges == 0 || pendingMerges < cfg.ClickHouse.MaxMerges {
+			merges = append(merges, m)
+			logrus.WithFields(logrus.Fields{
+				"table":          m.table,
+				"partition_id":   m.partitionID,
+				"partition_name": m.partitionName,
+				"age":            age,
+				"parts":          parts,
+				"max_time":       maxTime,
+				"rollup_time":    rollupTime,
+				"modified_at":    modifiedAt,
+			}).Debug("Merge to be applied")
+		} else {
+			logrus.WithFields(logrus.Fields{
+				"table":          m.table,
+				"partition_id":   m.partitionID,
+				"partition_name": m.partitionName,
+				"age":            age,
+				"parts":          parts,
+				"max_time":       maxTime,
+				"rollup_time":    rollupTime,
+				"modified_at":    modifiedAt,
+			}).Debug("Merge delayed")
+		}
+		pendingMerges++
 	}
 
 	if cfg.Daemon.DryRun {
-		logrus.Infof("DRY RUN. Merges would be applied: %d", len(merges))
+		logrus.Infof("DRY RUN. Merges would be applied: %d, delayed: %d", len(merges), pendingMerges-len(merges))
 		return nil
 	}
-	logrus.Infof("Merges will be applied: %d", len(merges))
+	logrus.Infof("Merges will be applied: %d, delayed: %d", len(merges), pendingMerges-len(merges))
 
 	for _, m := range merges {
-		m := m
 		err = applyMerge(&m)
 		if checkErr(err) != nil {
 			return err
@@ -397,6 +454,34 @@ func applyMerge(m *merge) error {
 		return nil
 	}
 	return fmt.Errorf("Fail to merge partition %v: %w", m.partitionName, checkErr(err))
+}
+
+func runningMerges() (map[string]int, error) {
+	err := cfg.ClickHouse.connect.Ping()
+	if checkErr(err) != nil {
+		logrus.Fatalf("Ping ClickHouse server failed: %v", err)
+	}
+
+	// Getting the rows with tables and partitions to optimize
+	rows, err := cfg.ClickHouse.connect.Query(SelectRunningMerges)
+	if checkErr(err) != nil {
+		return nil, err
+	}
+
+	merges := make(map[string]int)
+
+	// Parse the data from DB into `merges`
+	for rows.Next() {
+		var id string
+		var count int
+		err = rows.Scan(&id, &count)
+		if err != nil {
+			return nil, err
+		}
+		merges[id] = count
+	}
+
+	return merges, nil
 }
 
 func checkErr(err error) error {
